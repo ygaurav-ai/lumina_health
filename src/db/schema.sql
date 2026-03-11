@@ -1,5 +1,5 @@
 -- ═══════════════════════════════════════════════════════════════════════════
--- LUMINA HEALTH — Phase 0 PostgreSQL Schema
+-- LUMINA HEALTH — Phase 0 + Phase 1 PostgreSQL Schema
 -- Run once against your database: psql $DATABASE_URL -f schema.sql
 -- ═══════════════════════════════════════════════════════════════════════════
 
@@ -70,3 +70,20 @@ CREATE TABLE IF NOT EXISTS nutrition_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_nutrition_user_ts ON nutrition_events (user_id, ts DESC);
+
+-- ─── baselines ─────────────────────────────────────────────────────────────
+-- Caches rolling-median baseline computations so the dashboard does not
+-- need to re-scan 30 days of physiology_samples on every request.
+-- One row per (user_id, metric_type). Recomputed nightly (or on demand via
+-- GET /api/v1/user/:id/baseline).
+--
+-- metric_type examples: 'hrv_median', 'rhr_median', 'resp_median'
+CREATE TABLE IF NOT EXISTS baselines (
+  user_id      UUID        NOT NULL REFERENCES user_profile(user_id) ON DELETE CASCADE,
+  metric_type  TEXT        NOT NULL,
+  median_value FLOAT       NOT NULL,
+  computed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY  (user_id, metric_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_baselines_user ON baselines (user_id);

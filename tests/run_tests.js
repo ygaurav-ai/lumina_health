@@ -63,6 +63,14 @@ const ILLNESS_RHR_RISE_BPM         = extractConst('ILLNESS_RHR_RISE_BPM');
 const EVIDENCE_MIN_DEVIATION_SIGMA = extractConst('EVIDENCE_MIN_DEVIATION_SIGMA');
 const EVIDENCE_TOP_N               = extractConst('EVIDENCE_TOP_N');
 
+// Phase 1 additional constants
+const IDEAL_DEEP_PCT               = extractConst('IDEAL_DEEP_PCT');
+const IDEAL_REM_PCT                = extractConst('IDEAL_REM_PCT');
+const SLEEP_STRAIN_ALPHA           = extractConst('SLEEP_STRAIN_ALPHA');
+const SLEEP_DEBT_BETA              = extractConst('SLEEP_DEBT_BETA');
+const SLEEP_NEED_MAX_HOURS         = extractConst('SLEEP_NEED_MAX_HOURS');
+const SLEEP_DEBT_MAX_HOURS         = extractConst('SLEEP_DEBT_MAX_HOURS');
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure formula implementations (mirrors src/routes/ingest.ts logic)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -572,6 +580,773 @@ describe('Schema file verification', () => {
     const sql = fs.readFileSync(path.join(__dirname, '../src/db/schema.sql'), 'utf8');
     ['hrv_sdnn','heart_rate','resting_hr','sleep_stage','vo2max','water_ml'].forEach(t => {
       assert.ok(sql.includes(`'${t}'`), `schema must include type '${t}'`);
+    });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 1 helper implementations (mirrors src/metrics/helpers.ts)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function normalizeRatio(value, ideal, maxRatio = 1.25) {
+  if (ideal <= 0) return 0;
+  const ratio = clamp(value / ideal, 0, maxRatio);
+  return (ratio / maxRatio) * 100;
+}
+
+function normalizePct(actualPct, idealPct) {
+  if (idealPct <= 0) return 0;
+  const ratio = clamp(actualPct / idealPct, 0, 1.2);
+  return clamp((ratio / 1.2) * 100 * 1.2, 0, 100); // effectively ratio*100, clamped
+}
+
+function normalizeDuration(totalSleepH, targetSleepH) {
+  if (targetSleepH <= 0) return 0;
+  const ratio = clamp(totalSleepH / targetSleepH, 0.50, 1.15);
+  return ((ratio - 0.50) / (1.15 - 0.50)) * 100;
+}
+
+function strainToRecoveryPenalty(strain) {
+  return -1 * (strain / 21) * STRAIN_PENALTY_MAX;
+}
+
+function getStrainCapacityFactor(recovery) {
+  if (recovery >= 85) return 1.10;
+  if (recovery >= 70) return 1.00;
+  if (recovery >= 50) return 0.85;
+  if (recovery >= 30) return 0.65;
+  return 0.30;
+}
+
+function redistribute(weights, removeKey) {
+  const result = { ...weights };
+  delete result[removeKey];
+  const total = Object.values(result).reduce((s, w) => s + w, 0);
+  if (total === 0) return result;
+  for (const k of Object.keys(result)) {
+    result[k] = result[k] / total;
+  }
+  return result;
+}
+
+function getRecoveryBand(score) {
+  if (score >= 90) return 'PEAK';
+  if (score >= 70) return 'HIGH';
+  if (score >= 50) return 'MODERATE';
+  if (score >= 30) return 'LOW';
+  return 'REST';
+}
+
+function computeBMR(weight_kg, height_cm, age, biological_sex, bmr_formula) {
+  if (bmr_formula === 'harris') {
+    if (biological_sex === 'male')   return (13.397*weight_kg) + (4.799*height_cm) - (5.677*age) + 88.362;
+    if (biological_sex === 'female') return (9.247*weight_kg)  + (3.098*height_cm) - (4.330*age) + 447.593;
+    const m = (13.397*weight_kg) + (4.799*height_cm) - (5.677*age) + 88.362;
+    const f = (9.247*weight_kg)  + (3.098*height_cm) - (4.330*age) + 447.593;
+    return (m + f) / 2;
+  }
+  // Mifflin-St Jeor (default)
+  if (biological_sex === 'male')   return (10*weight_kg) + (6.25*height_cm) - (5*age) + 5;
+  if (biological_sex === 'female') return (10*weight_kg) + (6.25*height_cm) - (5*age) - 161;
+  const m = (10*weight_kg) + (6.25*height_cm) - (5*age) + 5;
+  const f = (10*weight_kg) + (6.25*height_cm) - (5*age) - 161;
+  return (m + f) / 2;
+}
+
+function computeSleepNeed(target_hours, yesterdayStrain, sleepDebtH) {
+  const raw = target_hours + SLEEP_STRAIN_ALPHA * yesterdayStrain + SLEEP_DEBT_BETA * sleepDebtH;
+  return clamp(raw, target_hours, SLEEP_NEED_MAX_HOURS);
+}
+
+/** Compute sleep score from raw inputs (mirrors computeSleepScore formula). */
+function computeSleepScoreInline(totalSleepH, targetH, deepPct, remPct, efficiencyPct, strain = 0, debtH = 0) {
+  const sleepNeedH = computeSleepNeed(targetH, strain, debtH);
+  const durationScore   = normalizeDuration(totalSleepH, sleepNeedH);
+  const deepScore       = clamp((deepPct / IDEAL_DEEP_PCT) * 100, 0, 100);
+  const remScore        = clamp((remPct  / IDEAL_REM_PCT)  * 100, 0, 100);
+  const efficiencyScore = clamp(efficiencyPct, 0, 100);
+  return clamp(
+    SW_DURATION   * durationScore +
+    SW_DEEP       * deepScore +
+    SW_REM        * remScore +
+    SW_EFFICIENCY * efficiencyScore,
+    0, 100
+  );
+}
+
+/** Compute recovery score from raw signals (mirrors computeRecovery Layer 1+2). */
+function computeRecoveryInline({ hrv, baseHRV, rhr, baseRHR, respRate, baseResp, sleepScore, nutritionData, yesterdayStrain }) {
+  // HRV component
+  let hrvScore = null;
+  if (hrv !== null && baseHRV !== null && baseHRV > 0) {
+    const ratio = clamp(hrv / baseHRV, HRV_RATIO_MIN, HRV_RATIO_MAX);
+    hrvScore = ((ratio - HRV_RATIO_MIN) / (HRV_RATIO_MAX - HRV_RATIO_MIN)) * 100;
+  }
+
+  // RHR component
+  let rhrScore = 50;
+  if (rhr !== null && baseRHR !== null) {
+    const delta = baseRHR - rhr;
+    rhrScore = sigmoid(delta / RHR_SENSITIVITY);
+  }
+
+  // Resp component
+  let respScore = null;
+  if (respRate !== null && baseResp !== null) {
+    respScore = clamp(100 - ((respRate - baseResp) / 2) * 20, 0, 100);
+  }
+
+  // Weight normalisation
+  let weights = { hrv: W_HRV, sleep: W_SLEEP, rhr: W_RHR, resp: W_RESP };
+  if (hrvScore  === null) weights = redistribute(weights, 'hrv');
+  if (respScore === null) weights = redistribute(weights, 'resp');
+
+  const physioBase = clamp(
+    (weights.hrv   ?? 0) * (hrvScore  ?? 0) +
+    (weights.sleep ?? 0) * sleepScore +
+    (weights.rhr   ?? 0) * rhrScore +
+    (weights.resp  ?? 0) * (respScore ?? 0),
+    0, 100
+  );
+
+  // Layer 2
+  const interferenceScore = nutritionData?.sleep_interference_score ?? 0;
+  const proteinScore      = nutritionData?.protein_score ?? 0;
+  const interferencePenalty = (interferenceScore / 100) * SLEEP_INTERFERENCE_PENALTY;
+  const proteinBonus        = (proteinScore      / 100) * PROTEIN_RECOVERY_BONUS;
+  const nutritionModifier   = proteinBonus - interferencePenalty;
+
+  const strainPenalty = yesterdayStrain !== null ? strainToRecoveryPenalty(yesterdayStrain) : 0;
+  return Math.round(clamp(physioBase * (1 + nutritionModifier) + strainPenalty, 0, 100));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Phase 1 — B.2 Helper Functions: clamp & sigmoid', () => {
+
+  test('clamp(5, 0, 10) = 5 (within range)', () => {
+    assert.strictEqual(clamp(5, 0, 10), 5);
+  });
+
+  test('clamp(-1, 0, 10) = 0 (below min)', () => {
+    assert.strictEqual(clamp(-1, 0, 10), 0);
+  });
+
+  test('clamp(15, 0, 10) = 10 (above max)', () => {
+    assert.strictEqual(clamp(15, 0, 10), 10);
+  });
+
+  test('clamp(0, 0, 10) = 0 (at min boundary)', () => {
+    assert.strictEqual(clamp(0, 0, 10), 0);
+  });
+
+  test('clamp(10, 0, 10) = 10 (at max boundary)', () => {
+    assert.strictEqual(clamp(10, 0, 10), 10);
+  });
+
+  test('sigmoid(0) = 50 (inflection point)', () => {
+    approxEqual(sigmoid(0), 50, 0.01);
+  });
+
+  test('sigmoid(+large) → 100', () => {
+    assert.ok(sigmoid(100) > 99.9, 'sigmoid(100) should be near 100');
+  });
+
+  test('sigmoid(-large) → 0', () => {
+    assert.ok(sigmoid(-100) < 0.1, 'sigmoid(-100) should be near 0');
+  });
+
+  test('sigmoid is monotonically increasing', () => {
+    assert.ok(sigmoid(1) > sigmoid(0));
+    assert.ok(sigmoid(2) > sigmoid(1));
+    assert.ok(sigmoid(-1) < sigmoid(0));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Phase 1 — B.2 Helper Functions: normalize*', () => {
+
+  test('normalizeRatio: value == ideal → 80', () => {
+    approxEqual(normalizeRatio(10, 10), 80, 0.1);
+  });
+
+  test('normalizeRatio: value == 1.25x ideal → 100', () => {
+    approxEqual(normalizeRatio(12.5, 10), 100, 0.1);
+  });
+
+  test('normalizeRatio: value == 0 → 0', () => {
+    approxEqual(normalizeRatio(0, 10), 0, 0.01);
+  });
+
+  test('normalizeRatio: value > 1.25x ideal → clamped at 100', () => {
+    approxEqual(normalizeRatio(20, 10), 100, 0.01);
+  });
+
+  test('normalizePct: actual == ideal → 100', () => {
+    approxEqual(normalizePct(0.20, 0.20), 100, 0.01);
+  });
+
+  test('normalizePct: actual == 50% of ideal → 50', () => {
+    approxEqual(normalizePct(0.10, 0.20), 50, 0.01);
+  });
+
+  test('normalizePct: actual == 150% of ideal → 100 (capped)', () => {
+    approxEqual(normalizePct(0.30, 0.20), 100, 0.01);
+  });
+
+  test('normalizePct: zero idealPct → 0', () => {
+    assert.strictEqual(normalizePct(0.20, 0), 0);
+  });
+
+  test('normalizeDuration: 7.5h / 7.5h target → 76.9', () => {
+    approxEqual(normalizeDuration(7.5, 7.5), 76.9, 0.2);
+  });
+
+  test('normalizeDuration: below 50% of target → 0 (clamped)', () => {
+    approxEqual(normalizeDuration(3.0, 7.5), 0, 0.01);
+  });
+
+  test('normalizeDuration: at or above 115% of target → 100', () => {
+    approxEqual(normalizeDuration(8.625, 7.5), 100, 0.01);
+    approxEqual(normalizeDuration(10.0,  7.5), 100, 0.01);
+  });
+
+  test('normalizeDuration: 6.0h / 7.5h target → 46.2', () => {
+    // ratio = 0.80 → ((0.80 - 0.50) / 0.65) * 100 = 46.15
+    approxEqual(normalizeDuration(6.0, 7.5), 46.2, 0.5);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Phase 1 — B.2 Helper Functions: strain, capacity, redistribute, band', () => {
+
+  test('strainToRecoveryPenalty(0) = 0', () => {
+    // Use == (not strictEqual) because the formula yields -0, which === 0 but not Object.is(0)
+    assert.ok(strainToRecoveryPenalty(0) === 0, 'penalty at strain=0 must be 0');
+  });
+
+  test('strainToRecoveryPenalty(21) = -15 (max penalty)', () => {
+    approxEqual(strainToRecoveryPenalty(21), -15, 0.01);
+  });
+
+  test('strainToRecoveryPenalty(14) = -10', () => {
+    approxEqual(strainToRecoveryPenalty(14), -10, 0.01);
+  });
+
+  test('strainToRecoveryPenalty(7) = -5', () => {
+    approxEqual(strainToRecoveryPenalty(7), -5, 0.01);
+  });
+
+  test('getStrainCapacityFactor: recovery=90 → 1.10 (PEAK)', () => {
+    assert.strictEqual(getStrainCapacityFactor(90), 1.10);
+  });
+
+  test('getStrainCapacityFactor: recovery=85 → 1.10 (boundary)', () => {
+    assert.strictEqual(getStrainCapacityFactor(85), 1.10);
+  });
+
+  test('getStrainCapacityFactor: recovery=84 → 1.00 (HIGH)', () => {
+    assert.strictEqual(getStrainCapacityFactor(84), 1.00);
+  });
+
+  test('getStrainCapacityFactor: recovery=70 → 1.00', () => {
+    assert.strictEqual(getStrainCapacityFactor(70), 1.00);
+  });
+
+  test('getStrainCapacityFactor: recovery=60 → 0.85 (MODERATE)', () => {
+    assert.strictEqual(getStrainCapacityFactor(60), 0.85);
+  });
+
+  test('getStrainCapacityFactor: recovery=40 → 0.65 (LOW)', () => {
+    assert.strictEqual(getStrainCapacityFactor(40), 0.65);
+  });
+
+  test('getStrainCapacityFactor: recovery=20 → 0.30 (REST)', () => {
+    assert.strictEqual(getStrainCapacityFactor(20), 0.30);
+  });
+
+  test('redistribute: removes key, remaining weights sum to 1.0', () => {
+    const w = { hrv: 0.45, sleep: 0.30, rhr: 0.20, resp: 0.05 };
+    const result = redistribute(w, 'resp');
+    assert.ok(!('resp' in result), 'resp key should be removed');
+    const sum = Object.values(result).reduce((a, b) => a + b, 0);
+    approxEqual(sum, 1.0, 0.0001);
+  });
+
+  test('redistribute: proportionally rescales remaining keys', () => {
+    const w = { hrv: 0.45, sleep: 0.30, rhr: 0.20, resp: 0.05 };
+    const result = redistribute(w, 'resp');
+    // Each weight should be original / 0.95
+    approxEqual(result.hrv,   0.45 / 0.95, 0.0001);
+    approxEqual(result.sleep, 0.30 / 0.95, 0.0001);
+    approxEqual(result.rhr,   0.20 / 0.95, 0.0001);
+  });
+
+  test('redistribute: remove hrv, remaining sum to 1.0', () => {
+    const w = { hrv: 0.45, sleep: 0.30, rhr: 0.20, resp: 0.05 };
+    const result = redistribute(w, 'hrv');
+    const sum = Object.values(result).reduce((a, b) => a + b, 0);
+    approxEqual(sum, 1.0, 0.0001);
+  });
+
+  test('getRecoveryBand: 95 → PEAK', () => {
+    assert.strictEqual(getRecoveryBand(95), 'PEAK');
+  });
+
+  test('getRecoveryBand: 90 → PEAK (boundary)', () => {
+    assert.strictEqual(getRecoveryBand(90), 'PEAK');
+  });
+
+  test('getRecoveryBand: 89 → HIGH', () => {
+    assert.strictEqual(getRecoveryBand(89), 'HIGH');
+  });
+
+  test('getRecoveryBand: 70 → HIGH (boundary)', () => {
+    assert.strictEqual(getRecoveryBand(70), 'HIGH');
+  });
+
+  test('getRecoveryBand: 60 → MODERATE', () => {
+    assert.strictEqual(getRecoveryBand(60), 'MODERATE');
+  });
+
+  test('getRecoveryBand: 40 → LOW', () => {
+    assert.strictEqual(getRecoveryBand(40), 'LOW');
+  });
+
+  test('getRecoveryBand: 20 → REST', () => {
+    assert.strictEqual(getRecoveryBand(20), 'REST');
+  });
+
+  test('getRecoveryBand: 0 → REST', () => {
+    assert.strictEqual(getRecoveryBand(0), 'REST');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Phase 1 — B.1 BMR Computation (Mifflin-St Jeor & Harris-Benedict)', () => {
+  // Reference: 75kg, 180cm, 30 years old
+
+  test('Mifflin male: 10*75 + 6.25*180 - 5*30 + 5 = 1730', () => {
+    const bmr = computeBMR(75, 180, 30, 'male', 'mifflin');
+    approxEqual(bmr, 1730, 0.01);
+  });
+
+  test('Mifflin female: 10*75 + 6.25*180 - 5*30 - 161 = 1564', () => {
+    const bmr = computeBMR(75, 180, 30, 'female', 'mifflin');
+    approxEqual(bmr, 1564, 0.01);
+  });
+
+  test('Mifflin prefer_not_to_say = average of male + female = 1647', () => {
+    const bmr = computeBMR(75, 180, 30, 'prefer_not_to_say', 'mifflin');
+    approxEqual(bmr, 1647, 0.01);
+  });
+
+  test('Harris male: 13.397*75 + 4.799*180 - 5.677*30 + 88.362 ≈ 1786.6', () => {
+    const bmr = computeBMR(75, 180, 30, 'male', 'harris');
+    approxEqual(bmr, 1786.6, 0.5);
+  });
+
+  test('Harris female: 9.247*75 + 3.098*180 - 4.330*30 + 447.593 ≈ 1568.9', () => {
+    const bmr = computeBMR(75, 180, 30, 'female', 'harris');
+    approxEqual(bmr, 1568.9, 0.5);
+  });
+
+  test('Harris prefer_not_to_say = average of male + female ≈ 1677.8', () => {
+    const bmr = computeBMR(75, 180, 30, 'prefer_not_to_say', 'harris');
+    const male   = computeBMR(75, 180, 30, 'male',   'harris');
+    const female = computeBMR(75, 180, 30, 'female', 'harris');
+    approxEqual(bmr, (male + female) / 2, 0.01);
+  });
+
+  test('Mifflin male > Mifflin female (for same stats)', () => {
+    const male   = computeBMR(75, 180, 30, 'male',   'mifflin');
+    const female = computeBMR(75, 180, 30, 'female', 'mifflin');
+    assert.ok(male > female, `male BMR (${male}) should exceed female BMR (${female})`);
+  });
+
+  test('Higher weight → higher BMR (all else equal)', () => {
+    const lighter = computeBMR(60, 175, 35, 'male', 'mifflin');
+    const heavier = computeBMR(90, 175, 35, 'male', 'mifflin');
+    assert.ok(heavier > lighter, 'heavier person should have higher BMR');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Phase 1 — Sleep Need & Sleep Score Formula (D.3)', () => {
+
+  test('computeSleepNeed: no strain, no debt → target hours returned', () => {
+    const need = computeSleepNeed(7.5, 0, 0);
+    approxEqual(need, 7.5, 0.01);
+  });
+
+  test('computeSleepNeed: strain=14, debt=3h → 7.5 + 0.03*14 + 0.10*3 = 8.22h', () => {
+    const need = computeSleepNeed(7.5, 14, 3);
+    approxEqual(need, 8.22, 0.01);
+  });
+
+  test('computeSleepNeed: high strain + large debt → clamped at 10.0h', () => {
+    // 7.5 + 0.03*21 + 0.10*30 = 7.5 + 0.63 + 3.0 = 11.13 → clamped to 10
+    const need = computeSleepNeed(7.5, 21, 30);
+    approxEqual(need, SLEEP_NEED_MAX_HOURS, 0.01);
+  });
+
+  test('computeSleepNeed: clamped at minimum = target_hours (no negative)', () => {
+    // With no strain/debt, need cannot go below target
+    const need = computeSleepNeed(8.0, 0, 0);
+    assert.ok(need >= 8.0, `sleep need ${need} should not be below target 8.0`);
+  });
+
+  test('Sleep score: excellent night (7.5h, 20% deep, 22% rem, 95% eff) → ~90', () => {
+    // All signals near-ideal, target=7.5h
+    const score = computeSleepScoreInline(7.5, 7.5, 0.20, 0.22, 95);
+    // durationScore = normalizeDuration(7.5, 7.5) = 76.9
+    // deepScore=100, remScore=100, effScore=95
+    // score = 0.40*76.9 + 0.25*100 + 0.20*100 + 0.15*95 = 90.0
+    approxEqual(score, 90, 2);
+  });
+
+  test('Sleep score: short night (6.5h, 16% deep, 18% rem, 85% eff, target=8h) → ~68', () => {
+    const score = computeSleepScoreInline(6.5, 8.0, 0.16, 0.18, 85);
+    // durationScore = normalizeDuration(6.5, 8.0): ratio=0.8125 → 48.1
+    // deepScore = clamp((0.16/0.20)*100)=80, remScore=clamp((0.18/0.22)*100)=81.8, eff=85
+    // score = 0.40*48.1 + 0.25*80 + 0.20*81.8 + 0.15*85 = 68.3
+    approxEqual(score, 68, 4);   // D.3 spec says "64±8"
+  });
+
+  test('Sleep score: no sleep at all → 0', () => {
+    const score = computeSleepScoreInline(0, 7.5, 0, 0, 0);
+    // normalizeDuration(0, 7.5) = 0 (clamped at min 0.5 → 0)
+    // But deepScore/remScore/effScore are all 0 too → 0
+    approxEqual(score, 0, 1);
+  });
+
+  test('Sleep score: with strain-adjusted sleep need is harder to hit', () => {
+    // Same hours, but high strain increases sleep need → lower score
+    const noStrain = computeSleepScoreInline(7.5, 7.5, 0.20, 0.22, 90, 0,  0);
+    const withStrain = computeSleepScoreInline(7.5, 7.5, 0.20, 0.22, 90, 18, 2);
+    // With strain, sleepNeed rises → durationScore falls → overall score lower
+    assert.ok(withStrain <= noStrain,
+      `Score with strain (${withStrain.toFixed(1)}) should not exceed no-strain (${noStrain.toFixed(1)})`);
+  });
+
+  test('Sleep score is always in [0, 100]', () => {
+    const extreme_low  = computeSleepScoreInline(0,    7.5, 0,    0,    0);
+    const extreme_high = computeSleepScoreInline(10.0, 7.5, 0.30, 0.30, 100);
+    assert.ok(extreme_low  >= 0   && extreme_low  <= 100);
+    assert.ok(extreme_high >= 0   && extreme_high <= 100);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Phase 1 — Recovery Score Formula (D.3)', () => {
+
+  test('Recovery: HRV at baseline, neutral RHR, good sleep, no nutrition → ~66', () => {
+    // HRV ratio=1.0 → score=66.7, sleep=75, rhr=50 (sigmoid(0)), resp=null
+    const score = computeRecoveryInline({
+      hrv: 52, baseHRV: 52,
+      rhr: 57, baseRHR: 57,  // delta=0 → sigmoid(0)=50
+      respRate: null, baseResp: null,
+      sleepScore: 75,
+      nutritionData: null,
+      yesterdayStrain: null,
+    });
+    // weights after removing resp: hrv=0.4737, sleep=0.3158, rhr=0.2105
+    // physioBase = 0.4737*66.7 + 0.3158*75 + 0.2105*50 = 31.6+23.7+10.5 = 65.8
+    approxEqual(score, 66, 3);
+  });
+
+  test('Recovery: excellent HRV (>baseline), good sleep, low RHR → high score', () => {
+    // HRV: today=65, base=52 → ratio=1.25 (max) → score=100
+    // RHR: today=54, base=57 → delta=+3 → sigmoid(0.6)=64.5
+    const score = computeRecoveryInline({
+      hrv: 65, baseHRV: 52,
+      rhr: 54, baseRHR: 57,
+      respRate: null, baseResp: null,
+      sleepScore: 80,
+      nutritionData: null,
+      yesterdayStrain: null,
+    });
+    // physioBase = 0.4737*100 + 0.3158*80 + 0.2105*64.5 = 47.4+25.3+13.6 = 86.3
+    approxEqual(score, 86, 4);
+  });
+
+  test('Recovery: poor HRV, elevated RHR → low/moderate score (D.3: ~53±5)', () => {
+    // HRV: today=45, base=52 → ratio=0.865 → score=48.7
+    // RHR: today=60, base=57 → delta=-3 → sigmoid(-0.6)=35.5
+    const score = computeRecoveryInline({
+      hrv: 45, baseHRV: 52,
+      rhr: 60, baseRHR: 57,
+      respRate: null, baseResp: null,
+      sleepScore: 65,
+      nutritionData: null,
+      yesterdayStrain: null,
+    });
+    // physioBase = 0.4737*48.7 + 0.3158*65 + 0.2105*35.5 = 23.1+20.5+7.5 = 51.1
+    approxEqual(score, 51, 5);
+  });
+
+  test('Recovery: protein bonus lifts score', () => {
+    const without = computeRecoveryInline({
+      hrv: 52, baseHRV: 52, rhr: 57, baseRHR: 57,
+      respRate: null, baseResp: null, sleepScore: 75,
+      nutritionData: null, yesterdayStrain: null,
+    });
+    const withProtein = computeRecoveryInline({
+      hrv: 52, baseHRV: 52, rhr: 57, baseRHR: 57,
+      respRate: null, baseResp: null, sleepScore: 75,
+      nutritionData: { protein_score: 100, sleep_interference_score: 0 },
+      yesterdayStrain: null,
+    });
+    assert.ok(withProtein > without,
+      `Protein bonus should increase score (${withProtein} > ${without})`);
+    // Bonus = (100/100)*0.05 * physioBase ≈ 0.05 * 66 ≈ 3.3 pts
+    approxEqual(withProtein - without, 3, 2);
+  });
+
+  test('Recovery: sleep interference penalty reduces score', () => {
+    const without = computeRecoveryInline({
+      hrv: 52, baseHRV: 52, rhr: 57, baseRHR: 57,
+      respRate: null, baseResp: null, sleepScore: 75,
+      nutritionData: null, yesterdayStrain: null,
+    });
+    const withInterference = computeRecoveryInline({
+      hrv: 52, baseHRV: 52, rhr: 57, baseRHR: 57,
+      respRate: null, baseResp: null, sleepScore: 75,
+      nutritionData: { protein_score: 0, sleep_interference_score: 100 },
+      yesterdayStrain: null,
+    });
+    assert.ok(withInterference < without,
+      `Interference penalty should reduce score (${withInterference} < ${without})`);
+  });
+
+  test('Recovery: heavy prior-day strain applies penalty', () => {
+    const noStrain = computeRecoveryInline({
+      hrv: 52, baseHRV: 52, rhr: 57, baseRHR: 57,
+      respRate: null, baseResp: null, sleepScore: 75,
+      nutritionData: null, yesterdayStrain: null,
+    });
+    const withStrain = computeRecoveryInline({
+      hrv: 52, baseHRV: 52, rhr: 57, baseRHR: 57,
+      respRate: null, baseResp: null, sleepScore: 75,
+      nutritionData: null, yesterdayStrain: 21,
+    });
+    // strain=21 → penalty=-15 pts
+    assert.ok(withStrain < noStrain,
+      `Heavy strain should reduce score (${withStrain} < ${noStrain})`);
+    approxEqual(noStrain - withStrain, 15, 2);
+  });
+
+  test('Recovery: all signals null → score based on sleep only (weight redistributed)', () => {
+    // No HRV, no RHR, no resp → only sleep remains
+    // After removing hrv, resp (and rhr if null) — but rhr defaults to 50 (neutral)
+    const score = computeRecoveryInline({
+      hrv: null, baseHRV: null,
+      rhr: null, baseRHR: null,     // rhr defaults to 50 (neutral)
+      respRate: null, baseResp: null,
+      sleepScore: 80,
+      nutritionData: null,
+      yesterdayStrain: null,
+    });
+    // After removing hrv (null) and resp (null):
+    // weights = {sleep: 0.30/0.50=0.60, rhr: 0.20/0.50=0.40}
+    // physioBase = 0.60*80 + 0.40*50 = 48+20 = 68
+    assert.ok(score >= 0 && score <= 100, `score ${score} must be in [0, 100]`);
+  });
+
+  test('Recovery score is always in [0, 100]', () => {
+    // Worst case
+    const low = computeRecoveryInline({
+      hrv: 10, baseHRV: 80, rhr: 100, baseRHR: 50,
+      respRate: 25, baseResp: 16,
+      sleepScore: 0,
+      nutritionData: { protein_score: 0, sleep_interference_score: 100 },
+      yesterdayStrain: 21,
+    });
+    // Best case
+    const high = computeRecoveryInline({
+      hrv: 80, baseHRV: 52, rhr: 45, baseRHR: 65,
+      respRate: 12, baseResp: 15,
+      sleepScore: 95,
+      nutritionData: { protein_score: 100, sleep_interference_score: 0 },
+      yesterdayStrain: 0,
+    });
+    assert.ok(low  >= 0   && low  <= 100, `low score ${low} out of range`);
+    assert.ok(high >= 0   && high <= 100, `high score ${high} out of range`);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Phase 1 — Schema & Source File Verification', () => {
+
+  test('baselines table is defined in schema.sql', () => {
+    const sql = fs.readFileSync(path.join(__dirname, '../src/db/schema.sql'), 'utf8');
+    assert.ok(sql.includes('baselines'), 'schema.sql must define baselines table');
+  });
+
+  test('baselines table has PRIMARY KEY (user_id, metric_type)', () => {
+    const sql = fs.readFileSync(path.join(__dirname, '../src/db/schema.sql'), 'utf8');
+    // Should have PRIMARY KEY constraint with both columns
+    assert.ok(sql.includes('metric_type'), 'baselines must have metric_type column');
+    assert.ok(sql.toLowerCase().includes('primary key'), 'baselines must have PRIMARY KEY');
+  });
+
+  test('baselines table references user_profile (FK)', () => {
+    const sql = fs.readFileSync(path.join(__dirname, '../src/db/schema.sql'), 'utf8');
+    // The baselines block should reference user_profile
+    const baselinesSection = sql.split('baselines')[1] ?? '';
+    assert.ok(
+      baselinesSection.includes('user_profile') || sql.includes('REFERENCES user_profile'),
+      'baselines must have FK to user_profile'
+    );
+  });
+
+  test('src/metrics/helpers.ts exports computeBMR', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../src/metrics/helpers.ts'), 'utf8');
+    assert.ok(src.includes('export function computeBMR'), 'helpers.ts must export computeBMR');
+  });
+
+  test('src/metrics/helpers.ts exports all B.2 helper functions', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../src/metrics/helpers.ts'), 'utf8');
+    const required = [
+      'clamp', 'sigmoid', 'normalizeRatio', 'normalizePct',
+      'normalizeDuration', 'strainToRecoveryPenalty',
+      'getProteinMultiplier', 'getStrainCapacityFactor',
+      'redistribute', 'getRecoveryBand',
+    ];
+    required.forEach(fn => {
+      assert.ok(src.includes(`export function ${fn}`),
+        `helpers.ts must export function ${fn}`);
+    });
+  });
+
+  test('src/metrics/sleep.ts exports computeSleepScore', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../src/metrics/sleep.ts'), 'utf8');
+    assert.ok(src.includes('export async function computeSleepScore'));
+  });
+
+  test('src/metrics/recovery.ts exports computeRecovery', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../src/metrics/recovery.ts'), 'utf8');
+    assert.ok(src.includes('export async function computeRecovery'));
+  });
+
+  test('src/metrics/db_queries.ts exports buildMetricsDb', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../src/metrics/db_queries.ts'), 'utf8');
+    assert.ok(src.includes('export function buildMetricsDb'));
+  });
+
+  test('src/routes/profile.ts has PUT /api/v1/user/:id/profile route', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../src/routes/profile.ts'), 'utf8');
+    assert.ok(src.includes("'/api/v1/user/:id/profile'"),
+      'profile.ts must register PUT /api/v1/user/:id/profile');
+    assert.ok(src.includes('ON CONFLICT'), 'profile upsert must use ON CONFLICT');
+  });
+
+  test('src/routes/dashboard.ts registers baseline, dashboard, and explain routes', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../src/routes/dashboard.ts'), 'utf8');
+    assert.ok(src.includes('/api/v1/user/:id/baseline'),  'must register /baseline route');
+    assert.ok(src.includes('/api/v1/user/:id/dashboard'), 'must register /dashboard route');
+    assert.ok(src.includes('/api/v1/ai/explain'),          'must register /ai/explain route');
+  });
+
+  test('src/app.ts registers profileRoutes and dashboardRoutes', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../src/app.ts'), 'utf8');
+    assert.ok(src.includes('profileRoutes'),   'app.ts must register profileRoutes');
+    assert.ok(src.includes('dashboardRoutes'), 'app.ts must register dashboardRoutes');
+  });
+
+  test('Phase 1 health check returns phase: 1', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../src/app.ts'), 'utf8');
+    assert.ok(src.includes('phase: 1') || src.includes("phase:1"),
+      'health check must return phase: 1');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Phase 1 — Profile Validation Logic', () => {
+
+  function validateProfile(body) {
+    const errors = [];
+    const VALID_SEX      = new Set(['male', 'female', 'prefer_not_to_say']);
+    const VALID_GOAL     = new Set(['performance', 'endurance', 'weight_loss', 'longevity', 'general_health']);
+    const VALID_CHRONO   = new Set(['morning', 'intermediate', 'evening']);
+    const VALID_FORMULA  = new Set(['mifflin', 'harris']);
+
+    if (!body.weight_kg     || body.weight_kg <= 0)         errors.push('weight_kg must be > 0');
+    if (!body.height_cm     || body.height_cm <= 0)         errors.push('height_cm must be > 0');
+    if (!body.age           || body.age < 1 || body.age > 120) errors.push('age must be 1–120');
+    if (!VALID_SEX.has(body.biological_sex))                errors.push('invalid biological_sex');
+    if (!VALID_GOAL.has(body.fitness_goal))                  errors.push('invalid fitness_goal');
+    if (!body.sleep_target_hours || body.sleep_target_hours < 4 || body.sleep_target_hours > 12)
+      errors.push('sleep_target_hours must be 4–12');
+    if (!VALID_CHRONO.has(body.chronotype))                  errors.push('invalid chronotype');
+    if (!VALID_FORMULA.has(body.bmr_formula))                errors.push('invalid bmr_formula');
+    return errors;
+  }
+
+  const validProfile = {
+    weight_kg: 75, height_cm: 180, age: 30,
+    biological_sex: 'male', fitness_goal: 'performance',
+    sleep_target_hours: 7.5, chronotype: 'morning', bmr_formula: 'mifflin',
+  };
+
+  test('Valid profile → no validation errors', () => {
+    const errors = validateProfile(validProfile);
+    assert.strictEqual(errors.length, 0, `Unexpected errors: ${errors.join(', ')}`);
+  });
+
+  test('Missing weight_kg → validation error', () => {
+    const errors = validateProfile({ ...validProfile, weight_kg: null });
+    assert.ok(errors.some(e => e.includes('weight_kg')));
+  });
+
+  test('Invalid biological_sex → validation error', () => {
+    const errors = validateProfile({ ...validProfile, biological_sex: 'unknown' });
+    assert.ok(errors.some(e => e.includes('biological_sex')));
+  });
+
+  test('Invalid fitness_goal → validation error', () => {
+    const errors = validateProfile({ ...validProfile, fitness_goal: 'bulking' });
+    assert.ok(errors.some(e => e.includes('fitness_goal')));
+  });
+
+  test('sleep_target_hours < 4 → validation error', () => {
+    const errors = validateProfile({ ...validProfile, sleep_target_hours: 2 });
+    assert.ok(errors.some(e => e.includes('sleep_target_hours')));
+  });
+
+  test('sleep_target_hours > 12 → validation error', () => {
+    const errors = validateProfile({ ...validProfile, sleep_target_hours: 14 });
+    assert.ok(errors.some(e => e.includes('sleep_target_hours')));
+  });
+
+  test('All valid biological_sex values accepted', () => {
+    ['male', 'female', 'prefer_not_to_say'].forEach(sex => {
+      const errors = validateProfile({ ...validProfile, biological_sex: sex });
+      assert.ok(!errors.some(e => e.includes('biological_sex')),
+        `biological_sex='${sex}' should be valid`);
+    });
+  });
+
+  test('All valid fitness_goal values accepted', () => {
+    ['performance', 'endurance', 'weight_loss', 'longevity', 'general_health'].forEach(goal => {
+      const errors = validateProfile({ ...validProfile, fitness_goal: goal });
+      assert.ok(!errors.some(e => e.includes('fitness_goal')),
+        `fitness_goal='${goal}' should be valid`);
+    });
+  });
+
+  test('All valid chronotype values accepted', () => {
+    ['morning', 'intermediate', 'evening'].forEach(c => {
+      const errors = validateProfile({ ...validProfile, chronotype: c });
+      assert.ok(!errors.some(e => e.includes('chronotype')),
+        `chronotype='${c}' should be valid`);
     });
   });
 });

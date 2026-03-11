@@ -80,6 +80,43 @@ export interface IngestNutritionCsvResult {
   errors: string[];
 }
 
+// ─── Baselines (Phase 1) ─────────────────────────────────────────────────────
+
+export interface BaselineResult {
+  user_id:              string;
+  hrv_median:           number | null;
+  rhr_median:           number | null;
+  resp_median:          number | null;
+  days_of_data:         number;
+  baseline_established: boolean; // true when days_of_data >= 14
+  window_days:          number;
+  computed_at:          string;
+}
+
+// ─── Dashboard (Phase 1) ─────────────────────────────────────────────────────
+
+export interface DashboardNutritionBlock {
+  available:          boolean;
+  protein_score:      number | null;
+  protein_consumed_g: number | null;
+  protein_target_g:   number | null;
+  sleep_interference: number | null;
+  metabolic_balance:  number | null;
+  hydration_pct:      number | null;
+}
+
+// ─── AI Explain (Phase 1) ────────────────────────────────────────────────────
+
+export interface ExplainResponse {
+  user_id:          string;
+  question:         string;
+  explanation_text: string;
+  top_3_data_items: Array<{ label: string; value: string; direction: string }>;
+  action_hint:      string;
+  confidence:       string;
+  generated_by:     string; // 'template_v1' (Phase 1) → 'llm_v1' (Phase 3)
+}
+
 // ─── User Profile ────────────────────────────────────────────────────────────
 
 export type BiologicalSex = 'male' | 'female' | 'prefer_not_to_say';

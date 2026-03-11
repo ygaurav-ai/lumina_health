@@ -5,6 +5,8 @@
 import Fastify, { FastifyInstance } from 'fastify';
 import multipart from '@fastify/multipart';
 import { ingestRoutes } from './routes/ingest';
+import { profileRoutes } from './routes/profile';
+import { dashboardRoutes } from './routes/dashboard';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -23,9 +25,11 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   // ── Routes ─────────────────────────────────────────────────────────────────
   await app.register(ingestRoutes);
+  await app.register(profileRoutes);
+  await app.register(dashboardRoutes);
 
   // ── Health check ──────────────────────────────────────────────────────────
-  app.get('/health', async (_req, _reply) => ({ status: 'ok', phase: 0 }));
+  app.get('/health', async (_req, _reply) => ({ status: 'ok', phase: 1 }));
 
   return app;
 }
