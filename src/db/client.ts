@@ -2,7 +2,7 @@
  * PostgreSQL client — uses DATABASE_URL env var so it works on both
  * local Postgres and Replit (add DATABASE_URL to Replit Secrets panel).
  */
-import { Pool, PoolClient, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 
 const connectionString =
   process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/lumina_health';
@@ -10,7 +10,7 @@ const connectionString =
 export const pool = new Pool({ connectionString });
 
 /** Thin wrapper: run a parameterised query and return all rows. */
-export async function query<T = Record<string, unknown>>(
+export async function query<T extends QueryResultRow = Record<string, unknown>>(
   sql: string,
   params?: unknown[]
 ): Promise<QueryResult<T>> {

@@ -148,7 +148,7 @@ async function nutritionCsvIngestHandler(
     const collected: CsvNutritionRow[] = [];
     const stream = Readable.from(csvBuffer!);
     stream
-      .pipe(parse({ headers: true, trim: true, skipEmptyLines: true }))
+      .pipe(parse({ headers: true, trim: true, ignoreEmpty: true }))
       .on('data', (row: CsvNutritionRow) => collected.push(row))
       .on('end', () => resolve(collected))
       .on('error', reject);
